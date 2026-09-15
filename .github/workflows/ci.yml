@@ -24,8 +24,8 @@ jobs:
 
       # The suite expects the plugin to live at
       # data/plugins/kira-ai-plugin-noriengine-chat inside a KiraAI checkout
-      # (tests/test_host_smoke.py walks up to find the host root containing
-      # core/, and the other tests import core.* with the host as cwd).
+      # (tests/test_host_smoke.py walks up from the plugin directory to find
+      # the host root containing core/).
       - name: Checkout plugin into host layout
         uses: actions/checkout@v4
         with:
@@ -42,6 +42,11 @@ jobs:
           pip install -r KiraAI/requirements.txt
           pip install pytest pytest-asyncio
 
+      # Run from the plugin root: the tests import the plugin modules with
+      # bare `import main` / `import noriengine_*`, so running from the host
+      # root would shadow the plugin's main.py with the host entry script.
+      # The real-host smoke test locates the host checkout by walking up
+      # from the plugin directory on its own.
       - name: Run tests
-        working-directory: KiraAI
-        run: python -m pytest data/plugins/kira-ai-plugin-noriengine-chat/tests -q
+        working-directory: KiraAI/data/plugins/kira-ai-plugin-noriengine-chat
+        run: python -m pytest tests -q
