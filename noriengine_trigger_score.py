@@ -138,13 +138,14 @@ STRONG_SIGNAL_BASE_SCORE = 100
 
 @bot, reply-to-bot, nickname mention and waking word all land in this one
 tier (configurable via ``strong_signal_score``): they are explicit
-user-directed calls, so the tier is exempt from presence suppression — at
-the default 100 a strong signal always crosses the default threshold 80
-regardless of how large the bot's recent reply share is. The bot-to-bot @
-ping-pong this reopens is an accepted trade (still rate-limited by the
-busy round serialization); missing a direct call is the worse failure.
-Presence suppression keeps applying to every weaker tier (follow-up,
-ordinary).
+user-directed calls, so the tier is exempt from presence suppression. At
+the default 100 the raw score crosses the default threshold 80, but the
+pace multiplier (0.5 + 0.5 * pace) still scales the final score, so a
+pace factor below 1.0 can drop it under the threshold and send the
+message down the accumulation path instead. The bot-to-bot @ ping-pong
+this reopens is an accepted trade (still rate-limited by the busy round
+serialization); missing a direct call is the worse failure. Presence
+suppression keeps applying to every weaker tier (follow-up, ordinary).
 """
 
 # ---------------------------------------------------------------------------
