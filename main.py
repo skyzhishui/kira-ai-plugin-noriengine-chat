@@ -6,20 +6,26 @@ mutually exclusive; disable default-chat before enabling this plugin).
 
 Core behavior:
 - Every message enters the session buffer (unmentioned messages are kept as
-  follow-up context);
+  follow-up context); self-echo inbound events (sender == bot self id) are
+  dropped at entry — scoring them is a self-excitation loop the
+  strong-signal tier would amplify, and LLM sends are already written into
+  session memory at round end;
 - Private chat: whether to trigger a reply is decided directly by the active
   probability;
 - Group chat: each message is scored on arrival — backlog pressure is capped
   globally at 30 and never scaled by time-slot probability; ordinary messages
   (no @/mention) only reach the threshold through the extreme combination of
   fully maxed content signals plus a topped-out backlog; strong signals
-  (@bot etc.) trigger immediately once the threshold is reached; weak signals
-  accumulate per message as "score × time-slot probability" and trigger when
-  the accumulated score reaches the threshold;
+  (@bot / reply / waking word, one unified tier with a configurable base,
+  default 100) trigger immediately and are exempt from presence suppression;
+  weak signals accumulate per message as "score × time-slot probability" and
+  trigger when the accumulated score reaches the threshold;
 - Time-slot scheduling: group/private probabilities can be overridden per
   time slot; slots with probability 0 sleep completely;
 - Presence suppression: when the bot's recent reply share is too high, the
-  trigger score is automatically reduced;
+  trigger score is automatically reduced (strong signals exempt — an
+  explicit user-directed call must reach the threshold regardless of the
+  bot's recent activity share);
 - Poke gating: poke events do not trigger the LLM directly, they accumulate
   a base score (unaffected by time-slot probability); below the threshold a
   mechanical poke-back may fire (global cooldown + per-session consecutive
@@ -45,8 +51,25 @@ Core behavior:
   triggers do not start a concurrent round: they are deferred while keeping
   the accumulated score, and flushed together through a merge window after
   the round ends; the buffer cap is enlarged during busy periods to reduce
-  context loss while serialized; a watchdog timeout backstops a lost
-  round-end signal.
+  context loss while serialized; the round-end signal is matched against
+  the batch event id recorded at ON_LLM_REQUEST, so a late signal from a
+  round that already overstayed its watchdog cannot release the next
+  round's busy; the watchdog is derived from the host's provider/tool
+  timeout settings and capped by the user-tolerance knob
+  (busy_hold_timeout_seconds, default 300s), refreshed on every in-round
+  activity signal (LLM request/response, each tool result, each sent
+  step), so it acts as a silence detector — healthy rounds never trip
+  it regardless of duration, and a dead round releases quickly; a
+  tool-stage exception shortens the watchdog further since that death is
+  certain.
+- Busy-queue overflow spill: messages evicted from the session buffer
+  while a round is in flight (or a flush is armed) are parked in a
+  per-session spill list — capped by busy_spill_max, 0 disables — and
+  prepended back to the buffer head right before the post-round flush, so
+  the busy-queue cap bounds how much unprocessed context one round holds
+  without deleting what it cannot; when a round ends without a deferred
+  trigger, the parked messages are returned to the buffer as plain
+  rolling context instead.
 """
 
 import asyncio
@@ -80,6 +103,7 @@ from noriengine_session_state import (
 from noriengine_trigger_score import (
     CLUSTER_BONUS_POINTS,
     FOLLOWUP_BASE_POINTS,
+    STRONG_SIGNAL_BASE_SCORE,
     SignalWordlists,
     TriggerSnapshot,
     clean_chat_text,
@@ -127,11 +151,18 @@ class NoriEngineChatPlugin(BasePlugin):
         # Busy queue (LLM round serialization) runtime state: sessions with a
         # round in flight / sessions with a deferred trigger / per-session
         # watchdog tasks / sessions armed for flush (buffer-cap enlargement
-        # window)
+        # window) / per-session batch event id owning the in-flight round
+        # (recorded at ON_LLM_REQUEST; the round-end signal must match it)
         self.busy_sessions: set[str] = set()
         self.deferred_sids: set[str] = set()
         self.busy_watchdogs: dict[str, asyncio.Task] = {}
+        self.busy_owner: dict[str, str | None] = {}
         self.flush_pending: set[str] = set()
+        # Busy-queue overflow parking: per-session lists of buffer events
+        # evicted while a round is in flight / a flush is armed, prepended
+        # back to the buffer head before the next flush (bounded by
+        # busy_spill_max)
+        self.spill_buffers: dict[str, list[KiraMessageEvent]] = {}
         self._load_config()
 
     # ------------------------------------------------------------------
@@ -188,6 +219,11 @@ class NoriEngineChatPlugin(BasePlugin):
         # -- Trigger scoring --
         gate_cfg = pc.get("section_trigger", {}) or {}
         self.trigger_threshold = max(1, _as_int(gate_cfg, "trigger_threshold", 80))
+        # Unified strong-signal tier base: @bot / reply-to-bot / nickname /
+        # waking word all score this (exempt from presence suppression)
+        self.strong_signal_score = max(
+            0, _as_int(gate_cfg, "strong_signal_score", STRONG_SIGNAL_BASE_SCORE)
+        )
         self.reply_pace = _as_float(gate_cfg, "reply_pace", 1.0)
         self.group_reply_chance = min(1.0, max(0.0, _as_float(gate_cfg, "group_reply_chance", 0.5)))
         self.private_reply_chance = min(1.0, max(0.0, _as_float(gate_cfg, "private_reply_chance", 1.0)))
@@ -197,9 +233,33 @@ class NoriEngineChatPlugin(BasePlugin):
         # Busy queue: triggers are deferred while an LLM round is processing,
         # and released together once the round ends
         self.busy_queue_max = max(1, _as_int(gate_cfg, "busy_queue_max", 10))
-        self.busy_hold_timeout = min(
-            300.0, max(5.0, _as_float(gate_cfg, "busy_hold_timeout_seconds", 60.0))
+        # Watchdog timeout is DERIVED (see _derive_busy_hold_timeout): with
+        # the in-round activity refresh in place it only has to cover the
+        # longest silent gap between two refresh points, which follows the
+        # provider/tool timeout settings of the host. The one knob kept is
+        # the CAP: the longest silence users tolerate (default 300s) — a
+        # cap below the true segment bound may release a legitimately slow
+        # round early, which is the accepted trade (the damage is contained
+        # by owner pairing; a long silent bot is the worse failure).
+        # Re-derived at every round start so host-side timeout changes
+        # apply from the next round and a plugin-load order with
+        # not-yet-ready provider clients self-heals
+        self.busy_hold_cap = min(
+            1800.0, max(30.0, _as_float(gate_cfg, "busy_hold_timeout_seconds", 300.0))
         )
+        self.busy_hold_timeout = self._derive_busy_hold_timeout()
+        # Watchdog shortened on a tool-stage exception (see the
+        # ON_EXCEPTION hook): the tool path re-raises right after
+        # dispatching, so the death is certain and the release can be fast;
+        # 0 disables the shortening
+        self.busy_exception_timeout = min(
+            120.0, max(0.0, _as_float(gate_cfg, "busy_exception_timeout_seconds", 30.0))
+        )
+        # Busy-queue overflow parking cap: messages evicted from the session
+        # buffer while a round is in flight are parked (and restored before
+        # the next flush) up to this many; 0 disables the parking and keeps
+        # the legacy drop-on-eviction behavior
+        self.busy_spill_max = max(0, _as_int(gate_cfg, "busy_spill_max", 20))
         # -- Topic focus (continuity + cluster detection, both off by
         #    default, both scoped by the same session list) --
         topic_cfg = pc.get("section_topic", {}) or {}
@@ -259,6 +319,64 @@ class NoriEngineChatPlugin(BasePlugin):
         # -- Signal wordlists --
         self.wordlists = SignalWordlists.from_config(pc.get("section_wordlists", {}) or {})
 
+    def _derive_busy_hold_timeout(self) -> float:
+        """Derive the watchdog timeout from host settings instead of a
+        hand-tuned config value.
+
+        With the in-round refresh (ON_LLM_REQUEST / ON_LLM_RESPONSE /
+        ON_TOOL_RESULT / ON_STEP_RESULT) the watchdog only has to cover the
+        longest silent gap between two refresh points, not the whole round
+        duration: one LLM call (bounded by the model ``timeout`` setting,
+        default 120s), one tool call (bounded by
+        ``bot_config.agent.tool_call_timeout``, default 60s), or one
+        message-send chain (TTS etc., not bounded by a readable setting —
+        absorbed by the margin). The fast-LLM client timeout is included
+        because the publish→ON_LLM_REQUEST gap (VLM/STT preprocessing) has
+        no refresh point of its own.
+        """
+
+        timeouts: list[float] = []
+
+        # Provider-side timeouts: prefer the default and fast LLM clients'
+        # model config, fall back to the documented 120s default when
+        # unreadable
+        for getter_name in ("get_default_llm_client", "get_default_fast_llm_client"):
+            getter = getattr(self.ctx, getter_name, None)
+            if not callable(getter):
+                continue
+            try:
+                client = getter()
+                if client is None:
+                    continue
+                model_config = getattr(getattr(client, "model", None), "model_config", None)
+                if isinstance(model_config, dict):
+                    value = float(model_config.get("timeout", 120.0) or 120.0)
+                    if value > 0:
+                        timeouts.append(value)
+            except Exception:
+                continue
+        if not timeouts:
+            timeouts.append(120.0)
+
+        # Per-tool-call bound (refreshed per tool by ON_TOOL_RESULT)
+        try:
+            value = float(
+                (self.ctx.config.get_config("bot_config.agent.tool_call_timeout") or 60.0)
+            )
+            timeouts.append(value if value > 0 else 60.0)
+        except (AttributeError, TypeError, ValueError):
+            timeouts.append(60.0)
+
+        # Cap: the longest silence users tolerate (busy_hold_timeout_seconds,
+        # default 300s) — NOT a correctness bound. Below it the derivation
+        # follows the host faithfully; capping tighter than the real segment
+        # bound (a slow model's single 540s call is silent by definition)
+        # releases such rounds early, which is the accepted trade: the
+        # damage is one extra concurrent round contained by owner pairing,
+        # while the alternative — a bot silent past user tolerance — is the
+        # worse failure
+        return min(self.busy_hold_cap, max(timeouts) + 60.0)
+
     async def initialize(self):
         # Mutual-exclusion guard: running alongside the built-in default-chat
         # double-buffers/double-flushes every message (both register
@@ -285,17 +403,19 @@ class NoriEngineChatPlugin(BasePlugin):
         if self.prune_task is None or self.prune_task.done():
             self.prune_task = asyncio.create_task(self._prune_loop())
         logger.info(
-            "[NoriEngineChat] initialized: threshold=%d pace=%.2f group=%.2f private=%.2f "
+            "[NoriEngineChat] initialized: threshold=%d strong=%d pace=%.2f group=%.2f private=%.2f "
             "merge_wait=%.1fs slots=%d wake_words=%d poke_gate=%s(+%d) "
             "poke_back=%s(cooldown=%.1fs max=%d) busy_queue=%d hold_timeout=%.0fs "
+            "exc_watchdog=%.0fs spill=%d "
             "followup=%s(window=%.0fs score=%d) "
             "cluster=%s(window=%.0fs users=%d bonus=%d) topic_scope=%s",
-            self.trigger_threshold, self.reply_pace, self.group_reply_chance,
+            self.trigger_threshold, self.strong_signal_score, self.reply_pace, self.group_reply_chance,
             self.private_reply_chance, self.merge_wait, len(self.time_slots),
             len(self.waking_words),
             self.poke_gate_enabled, self.poke_base_score,
             self.poke_back_enabled, self.poke_back_cooldown_seconds, self.poke_back_max,
-            self.busy_queue_max, self.busy_hold_timeout,
+            self.busy_queue_max, self.busy_hold_timeout, self.busy_exception_timeout,
+            self.busy_spill_max,
             "on" if self.followup_window > 0.0 and self.followup_score > 0 else "off",
             self.followup_window, self.followup_score,
             "on" if (
@@ -323,9 +443,15 @@ class NoriEngineChatPlugin(BasePlugin):
         self.flush_tasks.clear()
         self.flush_events.clear()
         self.flush_pending.clear()
+        # Hand any parked spill back to the buffers before teardown, so the
+        # content survives a hot reload / plugin switch as rolling context
+        for sid in list(self.spill_buffers):
+            self._restore_spill(sid, self.ctx.get_buffer(sid))
+        self.spill_buffers.clear()
         self._poke_back_tasks.clear()
         self.busy_watchdogs.clear()
         self.busy_sessions.clear()
+        self.busy_owner.clear()
         self.deferred_sids.clear()
         if self.prune_task is not None:
             self.prune_task.cancel()
@@ -337,6 +463,24 @@ class NoriEngineChatPlugin(BasePlugin):
     # ------------------------------------------------------------------
     @on.im_message(priority=Priority.HIGH)
     async def handle_msg(self, event: KiraMessageEvent):
+        # Self-echo guard: some protocols echo the bot's own outbound
+        # messages back as inbound events (operator typing on the account,
+        # or a report-self-message protocol option). Scoring them is a
+        # self-excitation loop — and the strong-signal suppression exemption
+        # would amplify it (the echo carries the bot's own @) — so the drop
+        # is total: no scoring, no timeline trace (presence of adapter sends
+        # is already tracked by the message-sent hook; counting the echo as
+        # backlog would only re-inflate trigger pressure), no buffer either
+        # (LLM sends are already written into session memory at round end,
+        # so the echo adds nothing for them; the QQ adapter does not report
+        # message_sent events anyway, so nothing reaches here on that
+        # platform). When the platform provides no sender id there is no
+        # way to tell — keep the ordinary path
+        self_id = str(getattr(event.message, "self_id", "") or "")
+        if self_id and self._event_sender(event) == self_id:
+            logger.debug(f"[NoriEngineChat] 丢弃自身回声消息: sid={event.session.sid}")
+            return
+
         # Waking-word detection: text containing any waking word is treated
         # as a mention (same semantics as default-chat)
         for element in event.message.chain:
@@ -364,12 +508,10 @@ class NoriEngineChatPlugin(BasePlugin):
 
         # Buffer everything: unmentioned messages are kept as context too
         # (oldest trimmed beyond the cap); while busy / armed for flush a
-        # larger busy-queue cap is used instead, reducing context loss
-        # during round serialization
+        # larger busy-queue cap is used instead, and evicted messages are
+        # parked in the spill list instead of being dropped
         buffer = self.ctx.get_buffer(str(event.session))
-        cap = self._buffer_cap(sid)
-        if buffer is not None and buffer.get_length() >= cap:
-            buffer.pop(count=buffer.get_length() - cap + 1)
+        self._trim_buffer(sid, buffer)
         event.buffer()
 
         # Activity timeline entry (presence / idle statistics). Idle and the
@@ -508,8 +650,8 @@ class NoriEngineChatPlugin(BasePlugin):
                 # An @ segment aimed at the bot is the strongest direct
                 # signal; @all is not upgraded to an @ signal, but the host
                 # sets is_mentioned=True for @all, so it reaches the
-                # "mention" signal (80 points) and triggers a strong reply —
-                # identical to default-chat behavior, this is intended
+                # strong-signal tier and triggers a strong reply — identical
+                # to default-chat behavior, this is intended
                 if element.pid != "all" and element.pid == str(event.message.self_id):
                     has_at_bot = True
             elif isinstance(element, (Image, Record, Video)):
@@ -589,6 +731,7 @@ class NoriEngineChatPlugin(BasePlugin):
             bot_recent_replies=bot_replies,
             recent_window_total=window_total,
             pace_factor=self.reply_pace,
+            strong_signal_score=self.strong_signal_score,
             idle_above_average=idle_above_average,
             has_media=scan.has_media,
             has_weak_media=scan.has_weak_media,
@@ -639,9 +782,7 @@ class NoriEngineChatPlugin(BasePlugin):
         # (anonymous, low-value): a poke carries no discussion content, so
         # it never counts as a cluster participant
         buffer = self.ctx.get_buffer(str(event.session))
-        cap = self._buffer_cap(sid)
-        if buffer is not None and buffer.get_length() >= cap:
-            buffer.pop(count=buffer.get_length() - cap + 1)
+        self._trim_buffer(sid, buffer)
         event.buffer()
         gate = self.gates.get(sid)
         gate.note_incoming(now)
@@ -744,6 +885,64 @@ class NoriEngineChatPlugin(BasePlugin):
             return self.busy_queue_max
         return self.max_context_messages
 
+    def _trim_buffer(self, sid: str, buffer) -> None:
+        """Trim the session buffer to the current cap.
+
+        While a round is in flight or a flush is armed, evicted messages are
+        parked in the per-session spill list (bounded by busy_spill_max) and
+        restored right before the next flush — the busy-queue cap then bounds
+        how much unprocessed context one round holds, not how much survives
+        it. Outside those states (or with the parking disabled by
+        busy_spill_max=0) the eviction stays a plain rolling-context drop.
+        """
+
+        cap = self._buffer_cap(sid)
+        if buffer is None or buffer.get_length() < cap:
+            return
+        overflow = buffer.pop(count=buffer.get_length() - cap + 1) or []
+        if not overflow:
+            return
+        if self.busy_spill_max <= 0 or not (
+            sid in self.busy_sessions or sid in self.flush_pending
+        ):
+            return
+        spill = self.spill_buffers.setdefault(sid, [])
+        spill.extend(overflow)
+        excess = len(spill) - self.busy_spill_max
+        if excess > 0:
+            del spill[:excess]
+            logger.warning(
+                f"[NoriEngineChat] busy 溢出暂存已满({self.busy_spill_max})，"
+                f"丢弃最旧 {excess} 条: sid={sid}"
+            )
+        logger.debug(
+            f"[NoriEngineChat] busy 缓冲溢出转入暂存: sid={sid} "
+            f"spilled={len(overflow)} spill={len(spill)}"
+        )
+
+    def _restore_spill(self, sid: str, buffer) -> None:
+        """Prepend the session's spill list back to the buffer head (oldest
+        first, preserving global arrival order) and clear it.
+
+        Purely synchronous list operations: callers embed it in the same
+        scheduling slot as the following flush/trim decision, so no message
+        handling can interleave between the prepend and its consumption.
+        When no buffer can be resolved the spill is kept for a later
+        attempt.
+        """
+
+        spill = self.spill_buffers.get(sid)
+        if not spill:
+            return
+        if buffer is None:
+            return
+        # The host SessionBuffer exposes no requeue API; its drained list is
+        # the public ``buffer`` attribute (the same list ``flush`` drains),
+        # so a head insertion is the canonical way to put evicted events back
+        buffer.buffer[:0] = spill
+        del self.spill_buffers[sid]
+        logger.debug(f"[NoriEngineChat] 暂存消息放回缓冲: sid={sid} count={len(spill)}")
+
     def _trigger_or_defer(self, sid: str) -> None:
         """Unified trigger entry point: defer while an LLM round is processing
         (accumulated score kept), otherwise arm the flush directly."""
@@ -804,6 +1003,12 @@ class NoriEngineChatPlugin(BasePlugin):
                     # window and keep merging
                     continue
                 buffer = self.ctx.get_buffer(sid)
+                # Restore the busy-overflow spill before the emptiness check:
+                # spill-only content legitimately opens the post-round round
+                # (a deferred trigger is waiting on it); the prepend and the
+                # flush decision below share one scheduling slot, so no trim
+                # can interleave
+                self._restore_spill(sid, buffer)
                 if buffer is None or buffer.get_length() == 0:
                     continue
                 # Busy starts at publish time: it covers the whole span of
@@ -832,6 +1037,10 @@ class NoriEngineChatPlugin(BasePlugin):
             # entry would keep the session buffer cap permanently enlarged
             # to the busy-queue value
             self.flush_pending.discard(sid)
+            # Exception / cancellation / idle-exit backstop: nothing will
+            # consume the spill through this loop anymore — hand it back to
+            # the buffer as plain rolling context so the content survives
+            self._restore_spill(sid, self.ctx.get_buffer(sid))
             # Only clean up when this task still owns the session's
             # registration slot, to avoid deleting a successor task that
             # _arm_flush has already rebuilt under extreme timing
@@ -839,7 +1048,7 @@ class NoriEngineChatPlugin(BasePlugin):
                 self.flush_tasks.pop(sid, None)
                 self.flush_events.pop(sid, None)
 
-    def _mark_busy(self, sid: str) -> None:
+    def _mark_busy(self, sid: str, event_id: str | None = None) -> None:
         """Mark the session as inside an LLM round and (re)start the watchdog.
 
         Set at two points: flush-publish time (covering the multimodal
@@ -847,35 +1056,50 @@ class NoriEngineChatPlugin(BasePlugin):
         (resetting the watchdog when the round actually starts; if the
         previous round-end signal was lost, the arrival of a new round is
         the self-healing evidence).
+
+        ``event_id`` records which batch owns the round, read from the
+        ON_LLM_REQUEST event; the round-end signal must carry the same id to
+        release it. The publish path passes None, which invalidates the
+        previous owner: from publish onward a round-end signal with any
+        other id belongs to a round that already overstayed its watchdog,
+        and releasing on it would orphan the round actually in flight.
         """
         if sid not in self.busy_sessions:
             self.busy_sessions.add(sid)
             logger.debug(f"[NoriEngineChat] 会话进入 LLM 回合: sid={sid}")
+        self.busy_owner[sid] = event_id
+        # Re-derive per round start: host-side timeout changes apply from
+        # the next round, and a plugin-load order that had no provider
+        # clients yet self-heals here instead of keeping the fallback
+        self.busy_hold_timeout = self._derive_busy_hold_timeout()
         self._start_watchdog(sid)
 
-    def _start_watchdog(self, sid: str) -> None:
+    def _start_watchdog(self, sid: str, timeout: float | None = None) -> None:
         old = self.busy_watchdogs.get(sid)
         if old is not None and not old.done():
             old.cancel()
-        self.busy_watchdogs[sid] = asyncio.create_task(self._busy_watchdog(sid))
+        self.busy_watchdogs[sid] = asyncio.create_task(
+            self._busy_watchdog(sid, timeout if timeout is not None else self.busy_hold_timeout)
+        )
 
-    async def _busy_watchdog(self, sid: str) -> None:
+    async def _busy_watchdog(self, sid: str, timeout: float) -> None:
         """Round-end signal backstop: force the round to be considered over
         on timeout, so a lost signal cannot hang the session."""
         try:
-            await asyncio.sleep(self.busy_hold_timeout)
+            await asyncio.sleep(timeout)
         except asyncio.CancelledError:
             return
         if sid in self.busy_sessions:
             logger.warning(
-                f"[NoriEngineChat] LLM 回合看门狗超时({self.busy_hold_timeout:.0f}s)，"
+                f"[NoriEngineChat] LLM 回合看门狗超时({timeout:.0f}s)，"
                 f"强制判定回合结束: sid={sid}"
             )
             self._release_busy(sid, reason="watchdog")
 
     def _release_busy(self, sid: str, reason: str) -> None:
         """Round end: clear busy/watchdog; release any deferred trigger
-        through the normal merge window.
+        through the normal merge window, and with no deferred trigger hand
+        the busy-overflow spill back to the buffer as plain rolling context.
 
         Fully synchronous (no awaits), so on a single-threaded event loop it
         atomically interleaves with the busy check in handle_msg — a new
@@ -883,6 +1107,7 @@ class NoriEngineChatPlugin(BasePlugin):
         fully released normal state; no intermediate state is observable.
         """
         self.busy_sessions.discard(sid)
+        self.busy_owner.pop(sid, None)
         watchdog = self.busy_watchdogs.pop(sid, None)
         if watchdog is not None and not watchdog.done() and watchdog is not asyncio.current_task():
             watchdog.cancel()
@@ -890,6 +1115,11 @@ class NoriEngineChatPlugin(BasePlugin):
             self.deferred_sids.discard(sid)
             logger.info(f"[NoriEngineChat] LLM 回合结束({reason})，放行挂起触发: sid={sid}")
             self._arm_flush(sid)
+        else:
+            # No deferred trigger will carry the spill through the merge
+            # window: hand it back to the buffer immediately as plain
+            # rolling context (subject to the normal cap from here on)
+            self._restore_spill(sid, self.ctx.get_buffer(sid))
 
     @on.final_result(priority=Priority.MEDIUM)
     async def _on_final_result(self, event: KiraMessageBatchEvent, final_result, *_, **__) -> None:
@@ -897,14 +1127,115 @@ class NoriEngineChatPlugin(BasePlugin):
 
         Dispatched once per finished turn by ``handle_im_batch_message``
         (after the agent loop, before memory persistence), unconditionally —
-        including silent turns and memory-save failures. Filtered by sid, it
-        releases busy and re-arms any deferred trigger. Paths that dispatch
-        no hook (early returns / mid-round exceptions) are backstopped by
-        the watchdog.
+        including silent turns and memory-save failures. Two-level filter:
+        by sid, then by the batch event id recorded at ON_LLM_REQUEST — a
+        late signal from a round that already overstayed its watchdog (owner
+        is None between publish and ON_LLM_REQUEST, or carries the previous
+        round's id) must not release the round actually in flight. Paths
+        that dispatch no hook (early returns / mid-round exceptions) are
+        backstopped by the watchdog.
         """
         sid = event.session.sid
-        if sid in self.busy_sessions:
-            self._release_busy(sid, reason="final_result")
+        if sid not in self.busy_sessions:
+            return
+        arrived = getattr(event, "event_id", None)
+        if self.busy_owner.get(sid) != arrived:
+            logger.info(
+                f"[NoriEngineChat] 忽略过期的回合结束信号(回合仍在进行): "
+                f"sid={sid} owner={self.busy_owner.get(sid) or '无'} arrived={arrived}"
+            )
+            return
+        self._release_busy(sid, reason="final_result")
+
+    def _refresh_busy(self, event) -> None:
+        """Refresh the round watchdog on any in-round activity signal.
+
+        Called from the ON_LLM_REQUEST / ON_LLM_RESPONSE / ON_TOOL_RESULT /
+        ON_STEP_RESULT hooks: while the round keeps producing activity the
+        watchdog never fires, so it acts as a silence detector (bound to the
+        longest single segment: one LLM call, one tool call, one send chain)
+        instead of a whole-round duration estimate. Owner-paired: a stub
+        event from another plugin (or a late event of a previous round)
+        carries a different batch id and is ignored. Must never raise — the
+        host dispatches these hooks without per-handler exception capture
+        inside the agent loop.
+        """
+        try:
+            sid = getattr(getattr(event, "session", None), "sid", None)
+            if not sid or sid not in self.busy_sessions:
+                return
+            if self.busy_owner.get(sid) != getattr(event, "event_id", None):
+                return
+            self._start_watchdog(sid)
+        except Exception:
+            logger.exception("[NoriEngineChat] 看门狗刷新异常(已忽略)")
+
+    @on.llm_response(priority=Priority.MEDIUM)
+    async def refresh_busy_on_llm_response(
+        self, event: KiraMessageBatchEvent, llm_resp, *_, **__
+    ) -> None:
+        """Per-LLM-call watchdog refresh: every step of the agent loop
+        reports liveness (including the synthetic error response of an
+        exhausted model group, which still ends in a normal final_result)."""
+        self._refresh_busy(event)
+
+    @on.tool_result(priority=Priority.MEDIUM)
+    async def refresh_busy_on_tool_result(
+        self, event: KiraMessageBatchEvent, tool_result, *_, **__
+    ) -> None:
+        """Per-tool watchdog refresh: splits a multi-tool step into
+        independent segments so the derived timeout only has to cover ONE
+        tool call, not the whole tool batch."""
+        self._refresh_busy(event)
+
+    @on.step_result(priority=Priority.MEDIUM)
+    async def refresh_busy_on_step_result(
+        self, event: KiraMessageBatchEvent, step_result, *_, **__
+    ) -> None:
+        """Per-step watchdog refresh after the message-send chain (TTS etc.)
+        completes: keeps slow sends from tripping the silence watchdog."""
+        self._refresh_busy(event)
+
+    @on.exception(priority=Priority.MEDIUM)
+    async def shorten_watchdog_on_exception(
+        self, event: KiraMessageBatchEvent, exc_event, *_, **__
+    ) -> None:
+        """Shorten the watchdog when a tool-stage exception announces a dead
+        round.
+
+        The host dispatches ON_EXCEPTION from three sources with different
+        outcomes:
+        - ``tool`` (agent_executor): re-raised right after the dispatch —
+          the round WILL die and skip ON_FINAL_RESULT, so the busy release
+          can safely happen at the short timer instead of the full derived
+          timeout;
+        - ``plugin`` (hook framework): the hook exception is swallowed and
+          the round SURVIVES — shortening here would false-kill a live
+          round whose next LLM call may outlast the short timer, so it is
+          ignored;
+        - ``provider`` (exhausted model group): a synthetic error response
+          continues the loop to a normal ON_FINAL_RESULT — ignored.
+        Owner-paired like the refresh hooks; the next activity refresh
+        restores the full timeout if a round somehow survives.
+        """
+        try:
+            if self.busy_exception_timeout <= 0:
+                return
+            if getattr(exc_event, "source", "") != "tool":
+                return
+            sid = getattr(getattr(event, "session", None), "sid", None)
+            if not sid or sid not in self.busy_sessions:
+                return
+            if self.busy_owner.get(sid) != getattr(event, "event_id", None):
+                return
+            logger.warning(
+                f"[NoriEngineChat] 工具阶段异常，看门狗缩短为 "
+                f"{self.busy_exception_timeout:.0f}s: sid={sid} "
+                f"exc={getattr(exc_event, 'name', '')}"
+            )
+            self._start_watchdog(sid, self.busy_exception_timeout)
+        except Exception:
+            logger.exception("[NoriEngineChat] 异常看门狗处理失败(已忽略)")
 
     # ------------------------------------------------------------------
     # Presence tracking / group-chat prompt injection
@@ -928,10 +1259,11 @@ class NoriEngineChatPlugin(BasePlugin):
         default-chat) and refresh the round's busy state."""
 
         # ON_LLM_REQUEST means the round has actually started: reset the
-        # watchdog timer; the arrival of a new round necessarily means the
-        # previous round has ended, which also self-heals a lost round-end
-        # signal
-        self._mark_busy(event.session.sid)
+        # watchdog and record this batch as the busy owner (the round-end
+        # signal must carry the same event id); the arrival of a new round
+        # necessarily means the previous round has ended, which also
+        # self-heals a lost round-end signal
+        self._mark_busy(event.session.sid, getattr(event, "event_id", None))
         if not event.is_group_message() or not self.group_chat_prompt:
             return
         for prompt in req.system_prompt:
