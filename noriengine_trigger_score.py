@@ -3,8 +3,10 @@
 Quantitatively scores the current message snapshot as the gating basis for
 whether to trigger an LLM reply. Scoring dimensions:
 
-- Direct signals: @bot, mention (nickname / waking word / reply-to-bot),
-  follow-up window (topic continuity), private-chat session;
+- Direct signals: @bot, mention (nickname / waking word / reply-to-bot) —
+  one unified strong-signal tier with a configurable base (default 100)
+  that is exempt from presence suppression; follow-up window (topic
+  continuity), private-chat session;
 - Content signals: question, request, opinion seeking, text length,
   voice/image/video media bonus, file/forward minor bonus, low-value
   phrase penalty;
@@ -77,7 +79,7 @@ FOLLOWUP_BASE_POINTS = 50
 
 A message arriving within the configured follow-up window after the bot's
 last reply is likely directed at the bot, so it earns this direct-signal
-relevance tier (between mention 80 and private 40) and unlocks the
+relevance tier (between the strong-signal 100 and private 40) and unlocks the
 direct-context-only request/opinion hints. The tier is per-message: every
 message scored inside the window earns it (a new bot reply re-anchors the
 window). Alone it stays below the default threshold 80 — a plain follow-up
@@ -130,6 +132,21 @@ its ceiling."""
 
 PRESENCE_PENALTY_CEILING = 25
 """Theoretical ceiling of presence suppression points."""
+
+STRONG_SIGNAL_BASE_SCORE = 100
+"""Default base points of the unified strong-signal tier.
+
+@bot, reply-to-bot, nickname mention and waking word all land in this one
+tier (configurable via ``strong_signal_score``): they are explicit
+user-directed calls, so the tier is exempt from presence suppression. At
+the default 100 the raw score crosses the default threshold 80, but the
+pace multiplier (0.5 + 0.5 * pace) still scales the final score, so a
+pace factor below 1.0 can drop it under the threshold and send the
+message down the accumulation path instead. The bot-to-bot @ ping-pong
+this reopens is an accepted trade (still rate-limited by the busy round
+serialization); missing a direct call is the worse failure. Presence
+suppression keeps applying to every weaker tier (follow-up, ordinary).
+"""
 
 # ---------------------------------------------------------------------------
 # Default signal wordlists (overridable via WebUI config, see schema.json)
@@ -231,6 +248,9 @@ class TriggerSnapshot:
     # earns the additive bonus, see CLUSTER_BONUS_POINTS
     cluster_hot: bool = False
     cluster_bonus: int = 0
+    # Base points of the unified strong-signal tier (@bot / mention /
+    # waking word — see STRONG_SIGNAL_BASE_SCORE), from plugin config
+    strong_signal_score: int = STRONG_SIGNAL_BASE_SCORE
 
 
 @dataclass(frozen=True)
@@ -376,13 +396,15 @@ def evaluate_trigger_score(
     words = wordlists or SignalWordlists()
     low_content = low_content_set or words.low_content_replies
 
+    # Strong signals (@bot / mention / waking word) are explicit
+    # user-directed calls: they share the unified strong-signal tier below
+    # and are exempt from presence suppression further down
+    strong_signal = snapshot.has_at or snapshot.has_mention
+
     # ---- Direct signals ----
-    if snapshot.has_at:
-        relevance = 100
-        relevance_reason = "@"
-    elif snapshot.has_mention:
-        relevance = 80
-        relevance_reason = "提及"
+    if strong_signal:
+        relevance = snapshot.strong_signal_score
+        relevance_reason = "@" if snapshot.has_at else "提及"
     elif snapshot.followup and snapshot.followup_score > 0:
         relevance = snapshot.followup_score
         relevance_reason = "话题延续"
@@ -416,10 +438,14 @@ def evaluate_trigger_score(
     )
 
     # ---- Presence suppression ----
-    suppression = _presence_suppression(
+    suppressed_value = _presence_suppression(
         bot_recent_replies=snapshot.bot_recent_replies,
         recent_window_total=snapshot.recent_window_total,
     )
+    # Strong signals are exempt: an explicit user-directed call must reach
+    # the threshold regardless of the bot's recent reply share; every
+    # weaker tier (follow-up, ordinary) stays suppressed
+    suppression = 0 if strong_signal else suppressed_value
 
     # ---- Topic-cluster bonus ----
     # Ambient heat from several distinct participants: additive, not a
@@ -452,6 +478,8 @@ def evaluate_trigger_score(
         parts.append(
             f"存在感=-{suppression}(窗口={snapshot.bot_recent_replies}/{snapshot.recent_window_total})"
         )
+    elif strong_signal and suppressed_value > 0:
+        parts.append(f"存在感=强信号豁免(应-{suppressed_value})")
     if snapshot.idle_above_average:
         parts.append("闲时+15")
     parts.extend([f"节奏={pace:.3f}", f"倍率={multiplier:.2f}"])

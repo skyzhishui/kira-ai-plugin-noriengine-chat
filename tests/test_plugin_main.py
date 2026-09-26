@@ -11,6 +11,7 @@ import logging
 import sys
 import time
 import types
+import uuid
 
 import pytest
 
@@ -111,6 +112,9 @@ class _FakeEvent:
     def __init__(self, message: _FakeMessage, sid: str, ctx: "_FakeCtx"):
         self.message = message
         self.session = _FakeSession(sid)
+        # The real KiraMessageBatchEvent mints a unique id in __post_init__;
+        # the busy-owner pairing matches on it
+        self.event_id = uuid.uuid4().hex
         self._ctx = ctx
         self._buffered = False
 
@@ -129,14 +133,24 @@ class _FakeEvent:
 
 
 class _FakeBuffer:
+    """Mirror of the real SessionBuffer: the drained list lives in the
+    public ``buffer`` attribute and ``pop`` returns the popped events.
+    ``items`` stays as a read alias for the older assertions below."""
+
     def __init__(self):
-        self.items = []
+        self.buffer = []
+
+    @property
+    def items(self):
+        return self.buffer
 
     def get_length(self):
-        return len(self.items)
+        return len(self.buffer)
 
     def pop(self, count=1):
-        del self.items[:count]
+        popped = self.buffer[:count]
+        del self.buffer[:count]
+        return popped
 
 
 class _FakeAdapterManager:
@@ -304,6 +318,7 @@ class TestPluginBasics:
     def test_default_config_loaded(self):
         plugin, _ = _make_plugin()
         assert plugin.trigger_threshold == 80
+        assert plugin.strong_signal_score == 100
         assert plugin.group_reply_chance == 0.5
         assert plugin.private_reply_chance == 1.0
         assert plugin.merge_wait == 2.0
@@ -544,13 +559,10 @@ class TestGroupGating:
         asyncio.run(scenario())
         assert ctx.flushed == []
 
-    def test_presence_suppression_reduces_score(self):
-        # Bot reply share 100% + isolated single message (backlog 6):
-        # mention 80 + 6 - 25 (presence) = 61, below the threshold — under
-        # full suppression an isolated mention falls back to weak-signal
-        # accumulation and needs content signals or a burst to make up the
-        # difference (v1.3.0 semantics: presence reduction can hold back an
-        # isolated strong mention)
+    def test_strong_signal_exempt_from_presence_suppression(self):
+        # v1.5.0 semantics: strong signals (@/mention) are exempt from
+        # presence suppression — a saturated bot-reply share must not push
+        # a direct call below the threshold
         plugin, ctx = _make_plugin({"section_trigger": {"merge_wait_seconds": 0.2}})
         gate = plugin.gates.get(GROUP_SID)
         now = time.time()
@@ -558,21 +570,43 @@ class TestGroupGating:
             gate.note_bot_reply(now - 200 + i)
 
         event = _group_event(ctx, _FakeText("有人吗"), is_mentioned=True)
-        event.message.timestamp = int(now)
         suppressed = evaluate_trigger_score(
             plugin._build_snapshot(event, gate, now, False), plugin.wordlists
         )
-        assert suppressed.score == 61
+        # Strong tier 100 + single-message backlog 6, suppression exempted
+        assert suppressed.score == 106
+        assert "存在感=强信号豁免(应-25)" in suppressed.breakdown
 
-        # Control: the same message with no bot replies scores 86
-        # (mention 80 + single-message backlog 6)
+        # Control: the same message with no bot replies scores identically
         plugin2, ctx2 = _make_plugin({"section_trigger": {"merge_wait_seconds": 0.2}})
         event2 = _group_event(ctx2, _FakeText("有人吗"), is_mentioned=True)
         clean = evaluate_trigger_score(
             plugin2._build_snapshot(event2, plugin2.gates.get(GROUP_SID), now, False),
             plugin2.wordlists,
         )
-        assert clean.score == 86
+        assert clean.score == 106
+
+    def test_weak_tiers_still_suppressed(self):
+        # Presence suppression keeps braking every weaker tier: a saturated
+        # bot-reply share pushes a follow-up message (50) down to 50+6-25=31
+        plugin, ctx = _make_plugin(
+            {
+                "section_topic": {"followup_window_seconds": 30},
+                "section_trigger": {"merge_wait_seconds": 0.2},
+            }
+        )
+        gate = plugin.gates.get(GROUP_SID)
+        now = time.time()
+        for i in range(20):
+            gate.note_bot_reply(now - 200 + i)
+        gate.note_bot_reply(now - 5)  # anchor the follow-up window
+
+        event = _group_event(ctx, _FakeText("有人吗"), is_mentioned=False)
+        snapshot = plugin._build_snapshot(event, gate, now, False)
+        suppressed = evaluate_trigger_score(snapshot, plugin.wordlists)
+        assert snapshot.followup is True
+        assert suppressed.score == 31
+        assert "存在感=-25" in suppressed.breakdown
 
 
 class TestPrivateGating:
@@ -903,13 +937,14 @@ class TestDebounceIdleExit:
             await plugin.handle_msg(_group_event(ctx, _FakeAt(SELF_ID), _FakeText("在吗")))
             await asyncio.sleep(1.0)
             assert GROUP_SID not in plugin.flush_tasks
-            # Simulate the host round-end signal (the fake environment
-            # dispatches no on-final-result); otherwise the busy state
-            # after the first flush would defer the second trigger instead
-            # of recreating the task
-            await plugin._on_final_result(
-                _batch_event_for(GROUP_SID, ctx), _final_result_event()
-            )
+            # Simulate the host round start + round-end signal (the fake
+            # environment dispatches no hooks); the llm_request step records
+            # the owner id that final_result must match — otherwise the busy
+            # state after the first flush would defer the second trigger
+            # instead of recreating the task
+            batch = _batch_event_for(GROUP_SID, ctx)
+            await plugin.inject_group_prompt(batch, types.SimpleNamespace(system_prompt=[]))
+            await plugin._on_final_result(batch, _final_result_event())
             # New trigger after the idle exit: _arm_flush must rebuild the
             # task/event and flush normally
             await plugin.handle_msg(_group_event(ctx, _FakeAt(SELF_ID), _FakeText("还在吗")))
@@ -1245,6 +1280,10 @@ class TestBusyQueue:
         async def scenario():
             await plugin.initialize()
             plugin._mark_busy(GROUP_SID)
+            # The round actually starts: ON_LLM_REQUEST records the batch id
+            # as the busy owner
+            batch = _batch_event_for(GROUP_SID, ctx)
+            await plugin.inject_group_prompt(batch, types.SimpleNamespace(system_prompt=[]))
             await plugin.handle_msg(_group_event(ctx, _FakeAt(SELF_ID), _FakeText("在吗")))
             assert GROUP_SID in plugin.deferred_sids
             # Round-end hooks of other sessions must not affect this
@@ -1253,11 +1292,15 @@ class TestBusyQueue:
                 _batch_event_for("napcat:gm:999999", ctx), _final_result_event()
             )
             assert GROUP_SID in plugin.busy_sessions
-            # This session's round ends → release the deferred trigger →
-            # flush through the merge window
+            # A late signal from a stale round (unknown id) must not release
+            # the round actually in flight (owner pairing)
             await plugin._on_final_result(
                 _batch_event_for(GROUP_SID, ctx), _final_result_event()
             )
+            assert GROUP_SID in plugin.busy_sessions
+            # This session's owning round ends → release the deferred
+            # trigger → flush through the merge window
+            await plugin._on_final_result(batch, _final_result_event())
             assert GROUP_SID not in plugin.busy_sessions
             await asyncio.sleep(0.3)
             await plugin.terminate()
@@ -1281,9 +1324,11 @@ class TestBusyQueue:
             assert ctx.flushed == [GROUP_SID]
             # Round still in flight: busy must hold
             assert GROUP_SID in plugin.busy_sessions
-            await plugin._on_final_result(
-                _batch_event_for(GROUP_SID, ctx), _final_result_event()
-            )
+            # The round actually starts (ON_LLM_REQUEST records the owner),
+            # then the owning round ends → release
+            batch = _batch_event_for(GROUP_SID, ctx)
+            await plugin.inject_group_prompt(batch, types.SimpleNamespace(system_prompt=[]))
+            await plugin._on_final_result(batch, _final_result_event())
             assert GROUP_SID not in plugin.busy_sessions
             await plugin.terminate()
 
@@ -1293,7 +1338,9 @@ class TestBusyQueue:
         plugin, ctx = _make_plugin({"section_trigger": {"merge_wait_seconds": 0.1}})
 
         async def scenario():
-            plugin.busy_hold_timeout = 0.15  # bypass the config lower bound to shorten the watchdog
+            # shorten via the derivation itself: _mark_busy re-derives
+            # and would overwrite a plain attribute override
+            plugin._derive_busy_hold_timeout = lambda: 0.15
             plugin._mark_busy(GROUP_SID)
             await plugin.handle_msg(_group_event(ctx, _FakeAt(SELF_ID), _FakeText("在吗")))
             assert GROUP_SID in plugin.deferred_sids
@@ -1471,6 +1518,642 @@ class TestBusyQueue:
             # The merge loop exited on the exception; its registration was
             # cleaned up too
             assert GROUP_SID not in plugin.flush_tasks
+            await plugin.terminate()
+
+        asyncio.run(scenario())
+
+
+class TestBusySpill:
+    """Busy-queue overflow parking: messages evicted while a round is in
+    flight survive it — they rejoin the next flush (deferred release) or the
+    rolling context (no deferred release), instead of being dropped."""
+
+    @staticmethod
+    def _buffer_texts(ctx, sid):
+        return [e.message.chain[0].text for e in ctx.get_buffer(sid).items]
+
+    def test_busy_overflow_parks_in_spill(self):
+        # max_context 2 / busy cap 10: 2 pre-busy + 12 busy messages → the
+        # buffer holds the newest 10, the oldest 4 park in arrival order
+        plugin, ctx = _make_plugin(
+            {
+                "section_basic": {"max_context_messages": 2},
+                "section_trigger": {"burst_window_seconds": 0},
+            }
+        )
+
+        async def scenario():
+            for i in range(2):
+                await plugin.handle_msg(_group_event(ctx, _FakeText(f"闲聊{i}")))
+            plugin._mark_busy(GROUP_SID)
+            for i in range(12):
+                await plugin.handle_msg(_group_event(ctx, _FakeText(f"排队{i}")))
+            assert ctx.get_buffer(GROUP_SID).get_length() == 10
+            assert [
+                e.message.chain[0].text for e in plugin.spill_buffers[GROUP_SID]
+            ] == ["闲聊0", "闲聊1", "排队0", "排队1"]
+            await plugin.terminate()
+
+        asyncio.run(scenario())
+        # terminate hands the parked messages back to the buffer (content
+        # survives a hot reload), head-first in arrival order
+        assert ctx.get_buffer(GROUP_SID).get_length() == 14
+        assert self._buffer_texts(ctx, GROUP_SID)[:4] == [
+            "闲聊0", "闲聊1", "排队0", "排队1",
+        ]
+        assert plugin.spill_buffers == {}
+
+    def test_round_end_flush_restores_spill_first(self):
+        # Deferred release: the parked overflow is prepended to the buffer
+        # head right before the post-round flush — the next round sees the
+        # full sequence in arrival order
+        plugin, ctx = _make_plugin(
+            {
+                "section_basic": {"max_context_messages": 2},
+                "section_trigger": {"merge_wait_seconds": 0.1, "burst_window_seconds": 0},
+            }
+        )
+        flushed_items = []
+        orig_flush = ctx.message_processor.flush_session_messages
+
+        async def spy_flush(sid, extra_event=None):
+            flushed_items.append(self._buffer_texts(ctx, sid))
+            return await orig_flush(sid, extra_event)
+
+        ctx.message_processor.flush_session_messages = spy_flush
+
+        async def scenario():
+            plugin._mark_busy(GROUP_SID)
+            batch = _batch_event_for(GROUP_SID, ctx)
+            await plugin.inject_group_prompt(batch, types.SimpleNamespace(system_prompt=[]))
+            plugin.deferred_sids.add(GROUP_SID)
+            for i in range(12):
+                await plugin.handle_msg(_group_event(ctx, _FakeText(f"排队{i}")))
+            assert len(plugin.spill_buffers[GROUP_SID]) == 2
+            await plugin._on_final_result(batch, _final_result_event())
+            await asyncio.sleep(0.4)
+            await plugin.terminate()
+
+        asyncio.run(scenario())
+        assert ctx.flushed == [GROUP_SID]
+        assert flushed_items == [[f"排队{i}" for i in range(12)]]
+        assert plugin.spill_buffers == {}
+
+    def test_round_end_without_deferred_returns_spill_to_context(self):
+        # No deferred trigger: nothing will consume the spill through the
+        # merge window, so the release hands it back as plain rolling
+        # context — the normal cap (and its rolling drop) resumes on the
+        # next arrival
+        plugin, ctx = _make_plugin(
+            {
+                "section_basic": {"max_context_messages": 2},
+                "section_trigger": {"burst_window_seconds": 0},
+            }
+        )
+
+        async def scenario():
+            plugin._mark_busy(GROUP_SID)
+            for i in range(12):
+                await plugin.handle_msg(_group_event(ctx, _FakeText(f"排队{i}")))
+            assert len(plugin.spill_buffers[GROUP_SID]) == 2
+            plugin._release_busy(GROUP_SID, reason="final_result")
+            assert plugin.spill_buffers == {}
+            assert ctx.get_buffer(GROUP_SID).get_length() == 12
+            # Released and not armed: the normal cap applies again, oldest
+            # drop (no parking outside busy/armed states)
+            await plugin.handle_msg(_group_event(ctx, _FakeText("新的一条")))
+            assert ctx.get_buffer(GROUP_SID).get_length() == 2
+            await plugin.terminate()
+
+        asyncio.run(scenario())
+        assert ctx.flushed == []
+
+    def test_spill_cap_drops_oldest_with_warning(self, caplog):
+        plugin, ctx = _make_plugin(
+            {
+                "section_basic": {"max_context_messages": 2},
+                "section_trigger": {"burst_window_seconds": 0, "busy_spill_max": 3},
+            }
+        )
+
+        async def scenario():
+            plugin._mark_busy(GROUP_SID)
+            for i in range(15):
+                await plugin.handle_msg(_group_event(ctx, _FakeText(f"排队{i}")))
+            # overflow 5 (排队0..4), spill cap 3 → the 2 oldest are dropped
+            assert [
+                e.message.chain[0].text for e in plugin.spill_buffers[GROUP_SID]
+            ] == ["排队2", "排队3", "排队4"]
+            await plugin.terminate()
+
+        with caplog.at_level(logging.WARNING, logger="test.kira.plugin"):
+            asyncio.run(scenario())
+        assert any("溢出暂存" in r.message for r in caplog.records)
+
+    def test_spill_disabled_drops_overflow(self):
+        # busy_spill_max=0: legacy behavior — evicted messages are dropped
+        plugin, ctx = _make_plugin(
+            {
+                "section_basic": {"max_context_messages": 2},
+                "section_trigger": {"burst_window_seconds": 0, "busy_spill_max": 0},
+            }
+        )
+
+        async def scenario():
+            plugin._mark_busy(GROUP_SID)
+            for i in range(12):
+                await plugin.handle_msg(_group_event(ctx, _FakeText(f"排队{i}")))
+            assert plugin.spill_buffers == {}
+            assert ctx.get_buffer(GROUP_SID).get_length() == 10
+            await plugin.terminate()
+
+        asyncio.run(scenario())
+
+    def test_normal_trim_does_not_park(self):
+        # Outside busy/armed states the eviction stays the plain
+        # rolling-context drop
+        plugin, ctx = _make_plugin(
+            {
+                "section_basic": {"max_context_messages": 2},
+                "section_trigger": {"burst_window_seconds": 0},
+            }
+        )
+
+        async def scenario():
+            for i in range(5):
+                await plugin.handle_msg(_group_event(ctx, _FakeText(f"闲聊{i}")))
+            await plugin.terminate()
+
+        asyncio.run(scenario())
+        assert ctx.get_buffer(GROUP_SID).get_length() == 2
+        assert plugin.spill_buffers == {}
+
+    def test_poke_overflow_also_parks(self):
+        # The poke branch shares the trim path: busy-time poke overflow
+        # parks in the spill too
+        plugin, ctx = _make_plugin()
+
+        async def scenario():
+            plugin._mark_busy(GROUP_SID)
+            for _ in range(12):
+                await plugin.handle_msg(_poke_event(ctx))
+            assert len(plugin.spill_buffers[GROUP_SID]) == 2
+            await plugin.terminate()
+
+        asyncio.run(scenario())
+        assert plugin.spill_buffers == {}
+
+    def test_flush_failure_keeps_spill_content_in_buffer(self):
+        # Flush raises after the spill was restored: everything — including
+        # the restored overflow — stays in the buffer; the failed round
+        # loses nothing to the legacy eviction drop
+        plugin, ctx = _make_plugin(
+            {
+                "section_basic": {"max_context_messages": 2},
+                "section_trigger": {"merge_wait_seconds": 0.1, "burst_window_seconds": 0},
+            }
+        )
+
+        async def boom(sid, extra_event=None):
+            raise RuntimeError("flush boom")
+
+        ctx.message_processor.flush_session_messages = boom
+
+        async def scenario():
+            plugin._mark_busy(GROUP_SID)
+            batch = _batch_event_for(GROUP_SID, ctx)
+            await plugin.inject_group_prompt(batch, types.SimpleNamespace(system_prompt=[]))
+            plugin.deferred_sids.add(GROUP_SID)
+            for i in range(12):
+                await plugin.handle_msg(_group_event(ctx, _FakeText(f"排队{i}")))
+            await plugin._on_final_result(batch, _final_result_event())
+            await asyncio.sleep(0.4)
+            await plugin.terminate()
+
+        asyncio.run(scenario())
+        assert ctx.get_buffer(GROUP_SID).get_length() == 12
+        assert ctx.flushed == []
+        assert plugin.spill_buffers == {}
+
+
+class TestStrongSignalTier:
+    """v1.5.0: @/reply/waking word share one unified strong tier with a
+    configurable base (default 100); the base is wired through the plugin
+    config into the snapshot."""
+
+    def test_config_override(self):
+        plugin, _ = _make_plugin({"section_trigger": {"strong_signal_score": 90}})
+        assert plugin.strong_signal_score == 90
+
+    def test_at_triggers_even_under_saturated_presence(self):
+        # Suppression exemption: 20/20 bot-reply share must not hold back
+        # a direct @ call
+        plugin, ctx = _make_plugin({"section_trigger": {"merge_wait_seconds": 0.1}})
+        gate = plugin.gates.get(GROUP_SID)
+        now = time.time()
+        for i in range(20):
+            gate.note_bot_reply(now - 200 + i)
+
+        async def scenario():
+            event = _group_event(ctx, _FakeAt(SELF_ID), _FakeText("在吗"))
+            await plugin.handle_msg(event)
+            await asyncio.sleep(0.3)
+            await plugin.terminate()
+
+        asyncio.run(scenario())
+        assert ctx.flushed == [GROUP_SID]
+
+    def test_custom_base_below_threshold_accumulates(self):
+        # strong_signal_score 70 < threshold 80: a mention no longer
+        # triggers immediately, it accumulates as a weak signal
+        plugin, ctx = _make_plugin(
+            {
+                "section_trigger": {
+                    "strong_signal_score": 70,
+                    "merge_wait_seconds": 0.1,
+                    "burst_window_seconds": 0,
+                }
+            }
+        )
+
+        async def scenario():
+            event = _group_event(ctx, _FakeText("有人吗"), is_mentioned=True)
+            await plugin.handle_msg(event)
+            # 70 raw, single-message backlog 6 → 76; unscaled 0 → scaled by
+            # group chance 0.5 → accumulates 38 instead of flushing
+            assert plugin.gates.get(GROUP_SID).pending_score == pytest.approx(38.0)
+            await plugin.terminate()
+
+        asyncio.run(scenario())
+        assert ctx.flushed == []
+
+
+class TestSelfEchoGuard:
+    """Inbound events whose sender is the bot itself are dropped at entry:
+    scoring them is a self-excitation loop the strong-signal tier would
+    amplify, and LLM sends are already written into session memory at round
+    end, so the echo adds nothing for them (v1.5.0 semantics)."""
+
+    def _self_echo_event(self, ctx, *chain):
+        msg = _FakeMessage(
+            list(chain),
+            self_id=SELF_ID,
+            is_mentioned=False,
+            group=_FakeGroup(),
+            sender=types.SimpleNamespace(user_id=SELF_ID, nickname="bot"),
+        )
+        return _FakeEvent(msg, GROUP_SID, ctx)
+
+    def test_self_echo_dropped_before_buffer_or_scoring(self):
+        plugin, ctx = _make_plugin({"section_trigger": {"merge_wait_seconds": 0.1}})
+        # The echo carries the bot's own @: without the guard this is a
+        # strong signal → flush loop
+        event = self._self_echo_event(ctx, _FakeAt(SELF_ID), _FakeText("我发出的消息"))
+
+        async def scenario():
+            await plugin.handle_msg(event)
+            await asyncio.sleep(0.3)
+
+        asyncio.run(scenario())
+        assert event._buffered is False
+        assert ctx.get_buffer(GROUP_SID).get_length() == 0
+        assert ctx.flushed == []
+        assert plugin.gates.get(GROUP_SID).pending_score == 0.0
+        # The timeline stays clean: no presence/burst/cluster pollution
+        # (presence of adapter sends is tracked by the message-sent hook)
+        gate = plugin.gates.get(GROUP_SID)
+        assert gate.window_stats(20, 10.0) == (0, 0)
+        assert gate.cluster_stats(time.time(), 30.0) == (0, False)
+
+    def test_other_sender_processed_normally(self):
+        plugin, ctx = _make_plugin({"section_trigger": {"merge_wait_seconds": 0.1}})
+        event = _group_event(ctx, _FakeText("正常消息"))
+
+        async def scenario():
+            await plugin.handle_msg(event)
+            await plugin.terminate()
+
+        asyncio.run(scenario())
+        assert event._buffered is True
+
+    def test_missing_sender_keeps_ordinary_path(self):
+        # Adapters that provide no sender id cannot be identified as self —
+        # keep the ordinary path rather than dropping everything
+        plugin, ctx = _make_plugin({"section_trigger": {"merge_wait_seconds": 0.1}})
+        msg = _FakeMessage(
+            [_FakeText("无发送者消息")],
+            self_id=SELF_ID,
+            group=_FakeGroup(),
+            sender=types.SimpleNamespace(user_id="", nickname=""),
+        )
+        event = _FakeEvent(msg, GROUP_SID, ctx)
+
+        async def scenario():
+            await plugin.handle_msg(event)
+            await plugin.terminate()
+
+        asyncio.run(scenario())
+        assert event._buffered is True
+
+
+class TestBusyOwner:
+    """v1.5.0 round pairing: busy is owned by the batch event recorded at
+    ON_LLM_REQUEST; the round-end signal must carry the same id. A late
+    signal from a round that already overstayed its watchdog must not
+    release the round actually in flight."""
+
+    def test_publish_invalidates_previous_owner(self):
+        plugin, ctx = _make_plugin()
+
+        async def scenario():
+            batch = _batch_event_for(GROUP_SID, ctx)
+            await plugin.inject_group_prompt(batch, types.SimpleNamespace(system_prompt=[]))
+            assert plugin.busy_owner[GROUP_SID] == batch.event_id
+            # Flush publish (no id) resets the owner: from here any
+            # round-end signal with an id belongs to a stale round
+            plugin._mark_busy(GROUP_SID)
+            assert plugin.busy_owner[GROUP_SID] is None
+            await plugin._on_final_result(batch, _final_result_event())
+            assert GROUP_SID in plugin.busy_sessions
+            await plugin.terminate()
+
+        asyncio.run(scenario())
+
+    def test_mismatched_final_result_does_not_release(self):
+        plugin, ctx = _make_plugin()
+
+        async def scenario():
+            batch = _batch_event_for(GROUP_SID, ctx)
+            await plugin.inject_group_prompt(batch, types.SimpleNamespace(system_prompt=[]))
+            await plugin._on_final_result(
+                _batch_event_for(GROUP_SID, ctx), _final_result_event()
+            )
+            assert GROUP_SID in plugin.busy_sessions
+            # The owning id releases
+            await plugin._on_final_result(batch, _final_result_event())
+            assert GROUP_SID not in plugin.busy_sessions
+            await plugin.terminate()
+
+        asyncio.run(scenario())
+
+    def test_new_llm_request_selfheals_owner(self):
+        plugin, ctx = _make_plugin()
+
+        async def scenario():
+            old = _batch_event_for(GROUP_SID, ctx)
+            await plugin.inject_group_prompt(old, types.SimpleNamespace(system_prompt=[]))
+            # A new round adopts the busy state and overwrites the owner
+            new = _batch_event_for(GROUP_SID, ctx)
+            await plugin.inject_group_prompt(new, types.SimpleNamespace(system_prompt=[]))
+            assert plugin.busy_owner[GROUP_SID] == new.event_id
+            await plugin._on_final_result(old, _final_result_event())
+            assert GROUP_SID in plugin.busy_sessions
+            await plugin._on_final_result(new, _final_result_event())
+            assert GROUP_SID not in plugin.busy_sessions
+            await plugin.terminate()
+
+        asyncio.run(scenario())
+
+    def test_watchdog_release_ignores_owner_and_clears_it(self):
+        plugin, ctx = _make_plugin()
+
+        async def scenario():
+            plugin._derive_busy_hold_timeout = lambda: 0.15
+            batch = _batch_event_for(GROUP_SID, ctx)
+            await plugin.inject_group_prompt(batch, types.SimpleNamespace(system_prompt=[]))
+            await asyncio.sleep(0.4)
+            assert GROUP_SID not in plugin.busy_sessions
+            assert GROUP_SID not in plugin.busy_owner
+            await plugin.terminate()
+
+        asyncio.run(scenario())
+
+    def test_other_session_final_result_untouched(self):
+        plugin, ctx = _make_plugin()
+
+        async def scenario():
+            batch = _batch_event_for(GROUP_SID, ctx)
+            await plugin.inject_group_prompt(batch, types.SimpleNamespace(system_prompt=[]))
+            await plugin._on_final_result(
+                _batch_event_for("napcat:gm:999999", ctx), _final_result_event()
+            )
+            assert GROUP_SID in plugin.busy_sessions
+            await plugin.terminate()
+
+        asyncio.run(scenario())
+
+
+class TestBusyWatchdogRefresh:
+    """The watchdog is a silence detector — refreshed on every in-round
+    activity signal (LLM request/response, per tool result, per sent step),
+    derived from host settings and capped by the busy_hold_timeout_seconds
+    config, and shortened on a tool-stage exception (certain death) while
+    plugin / provider exception sources are ignored (the round survives
+    them)."""
+
+    def test_derived_defaults_without_host_surface(self):
+        # Fake ctx exposes no provider clients or config: documented
+        # fallbacks (provider 120 + tool 60) + 60 margin
+        plugin, _ = _make_plugin()
+        assert plugin.busy_hold_timeout == 180
+        assert plugin.busy_exception_timeout == 30
+
+    def test_derived_from_host_settings(self):
+        ctx = _FakeCtx()
+        ctx.get_default_llm_client = lambda: types.SimpleNamespace(
+            model=types.SimpleNamespace(model_config={"timeout": 240})
+        )
+        ctx.get_default_fast_llm_client = lambda: types.SimpleNamespace(
+            model=types.SimpleNamespace(model_config={"timeout": 300})
+        )
+        ctx.config = types.SimpleNamespace(
+            get_config=lambda key: {"bot_config.agent.tool_call_timeout": 90}.get(key)
+        )
+        plugin = plugin_main.NoriEngineChatPlugin(ctx, {})
+        # max(240, 300, 90) + 60 = 360 → capped at the default 300s cap
+        assert plugin.busy_hold_timeout == 300
+        assert plugin.busy_hold_cap == 300
+
+    def test_activity_refresh_replaces_watchdog(self):
+        plugin, ctx = _make_plugin()
+        batch = _batch_event_for(GROUP_SID, ctx)
+
+        async def scenario():
+            await plugin.inject_group_prompt(batch, types.SimpleNamespace(system_prompt=[]))
+            t1 = plugin.busy_watchdogs[GROUP_SID]
+            await plugin.refresh_busy_on_llm_response(batch, types.SimpleNamespace())
+            t2 = plugin.busy_watchdogs[GROUP_SID]
+            assert t2 is not t1
+            await asyncio.sleep(0.01)
+            assert t1.cancelled() or t1.done()
+            # per-tool and per-step signals refresh as well
+            t3 = plugin.busy_watchdogs[GROUP_SID]
+            await plugin.refresh_busy_on_tool_result(batch, types.SimpleNamespace())
+            assert plugin.busy_watchdogs[GROUP_SID] is not t3
+            t4 = plugin.busy_watchdogs[GROUP_SID]
+            await plugin.refresh_busy_on_step_result(batch, types.SimpleNamespace())
+            assert plugin.busy_watchdogs[GROUP_SID] is not t4
+            assert GROUP_SID in plugin.busy_sessions
+            await plugin.terminate()
+
+        asyncio.run(scenario())
+
+    def test_refresh_ignores_owner_mismatch_and_other_sessions(self):
+        plugin, ctx = _make_plugin()
+        batch = _batch_event_for(GROUP_SID, ctx)
+        other = _batch_event_for(GROUP_SID, ctx)  # different id, same sid
+
+        async def scenario():
+            await plugin.inject_group_prompt(batch, types.SimpleNamespace(system_prompt=[]))
+            t1 = plugin.busy_watchdogs[GROUP_SID]
+            # Stub events from third-party plugins (or late events of a
+            # previous round) carry a different batch id: ignored
+            await plugin.refresh_busy_on_llm_response(other, types.SimpleNamespace())
+            assert plugin.busy_watchdogs[GROUP_SID] is t1
+            # A session with no round in flight gains no watchdog entry
+            await plugin.refresh_busy_on_llm_response(
+                _batch_event_for("napcat:gm:999999", ctx), types.SimpleNamespace()
+            )
+            assert "napcat:gm:999999" not in plugin.busy_watchdogs
+            await plugin.terminate()
+
+        asyncio.run(scenario())
+
+    def test_tool_exception_shortens_watchdog_and_releases(self):
+        plugin, ctx = _make_plugin({"section_trigger": {"merge_wait_seconds": 0.1}})
+        plugin.busy_exception_timeout = 0.15
+        batch = _batch_event_for(GROUP_SID, ctx)
+
+        async def scenario():
+            await plugin.inject_group_prompt(batch, types.SimpleNamespace(system_prompt=[]))
+            await plugin.shorten_watchdog_on_exception(
+                batch, types.SimpleNamespace(source="tool", name="TimeoutError")
+            )
+            await asyncio.sleep(0.4)
+            # The tool path re-raises right after dispatching: the death is
+            # certain, so the busy releases at the short timer instead of
+            # the full derived watchdog
+            assert GROUP_SID not in plugin.busy_sessions
+            await plugin.terminate()
+
+        asyncio.run(scenario())
+
+    def test_plugin_and_provider_exceptions_do_not_shorten(self):
+        plugin, ctx = _make_plugin()
+        batch = _batch_event_for(GROUP_SID, ctx)
+
+        async def scenario():
+            await plugin.inject_group_prompt(batch, types.SimpleNamespace(system_prompt=[]))
+            t1 = plugin.busy_watchdogs[GROUP_SID]
+            # plugin-source exceptions are swallowed by the host framework
+            # (round survives); provider ones end via a normal
+            # final_result — shortening would false-kill a live round
+            for source in ("plugin", "provider"):
+                await plugin.shorten_watchdog_on_exception(
+                    batch, types.SimpleNamespace(source=source, name="X")
+                )
+                assert plugin.busy_watchdogs[GROUP_SID] is t1
+            assert GROUP_SID in plugin.busy_sessions
+            await plugin.terminate()
+
+        asyncio.run(scenario())
+
+    def test_exception_owner_mismatch_ignored(self):
+        plugin, ctx = _make_plugin()
+        batch = _batch_event_for(GROUP_SID, ctx)
+        other = _batch_event_for(GROUP_SID, ctx)
+
+        async def scenario():
+            await plugin.inject_group_prompt(batch, types.SimpleNamespace(system_prompt=[]))
+            t1 = plugin.busy_watchdogs[GROUP_SID]
+            await plugin.shorten_watchdog_on_exception(
+                other, types.SimpleNamespace(source="tool", name="X")
+            )
+            assert plugin.busy_watchdogs[GROUP_SID] is t1
+            await plugin.terminate()
+
+        asyncio.run(scenario())
+
+    def test_exception_timeout_zero_disables_shortening(self):
+        plugin, ctx = _make_plugin()
+        plugin.busy_exception_timeout = 0
+        batch = _batch_event_for(GROUP_SID, ctx)
+
+        async def scenario():
+            await plugin.inject_group_prompt(batch, types.SimpleNamespace(system_prompt=[]))
+            t1 = plugin.busy_watchdogs[GROUP_SID]
+            await plugin.shorten_watchdog_on_exception(
+                batch, types.SimpleNamespace(source="tool", name="X")
+            )
+            assert plugin.busy_watchdogs[GROUP_SID] is t1
+            await plugin.terminate()
+
+        asyncio.run(scenario())
+
+    def test_watchdog_hooks_never_raise_on_garbage(self):
+        # The host's exec_handler already captures hook exceptions (it
+        # routes them to ON_EXCEPTION), but these hooks must still swallow
+        # garbage input so they never add exception noise to a healthy round
+        plugin, _ = _make_plugin()
+
+        async def scenario():
+            await plugin.refresh_busy_on_llm_response(object(), None)
+            await plugin.refresh_busy_on_tool_result(None, None)
+            await plugin.refresh_busy_on_step_result(object(), None)
+            await plugin.shorten_watchdog_on_exception(object(), None)
+            await plugin.shorten_watchdog_on_exception(None, "not-an-event")
+
+        asyncio.run(scenario())
+
+
+class TestWatchdogDerivationReview:
+    """v1.6.2 (PR review follow-up + design iteration): the derived
+    watchdog is capped by the user-tolerance knob
+    (busy_hold_timeout_seconds, default 300) instead of a hard-coded
+    ceiling — a cap below the true segment bound may release a slow round
+    early, the accepted trade (owner pairing contains it) — and it is
+    re-derived at every round start so host-side timeout changes apply
+    from the next round (and a plugin-load order with not-yet-ready
+    provider clients self-heals)."""
+
+    def test_derived_value_capped_by_tolerance_knob(self):
+        ctx = _FakeCtx()
+        ctx.get_default_llm_client = lambda: types.SimpleNamespace(
+            model=types.SimpleNamespace(model_config={"timeout": 900})
+        )
+        ctx.get_default_fast_llm_client = lambda: None
+        plugin = plugin_main.NoriEngineChatPlugin(ctx, {})
+        # max(900, 60) + 60 = 960 → capped at the default 300s tolerance
+        assert plugin.busy_hold_timeout == 300
+
+    def test_raised_cap_lets_slow_model_follow_faithfully(self):
+        ctx = _FakeCtx()
+        ctx.get_default_llm_client = lambda: types.SimpleNamespace(
+            model=types.SimpleNamespace(model_config={"timeout": 480})
+        )
+        ctx.get_default_fast_llm_client = lambda: None
+        plugin = plugin_main.NoriEngineChatPlugin(
+            ctx, {"section_trigger": {"busy_hold_timeout_seconds": 900}}
+        )
+        # 480 + 60 = 540 < raised cap 900: healthy slow rounds keep their
+        # real bound
+        assert plugin.busy_hold_timeout == 540
+
+    def test_rederived_on_round_start(self):
+        plugin, ctx = _make_plugin()
+        assert plugin.busy_hold_timeout == 180  # fallback at plugin load
+
+        async def scenario():
+            # Provider clients become available after plugin load (or the
+            # host timeout is raised at runtime): the next round start
+            # picks the real value up
+            ctx.get_default_llm_client = lambda: types.SimpleNamespace(
+                model=types.SimpleNamespace(model_config={"timeout": 200})
+            )
+            ctx.get_default_fast_llm_client = lambda: None
+            plugin._mark_busy(GROUP_SID)
+            # 200 + 60 = 260, below the 300s cap
+            assert plugin.busy_hold_timeout == 260
             await plugin.terminate()
 
         asyncio.run(scenario())
