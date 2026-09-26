@@ -1,7 +1,5 @@
 """Unit tests for the reply trigger scoring engine."""
 
-import pytest
-
 from noriengine_trigger_score import (
     SignalWordlists,
     TriggerSnapshot,
@@ -166,14 +164,39 @@ class TestEvaluateTriggerScore:
         assert verdict.score >= 80
         assert "直接信号=100(@)" in verdict.breakdown
 
-    def test_mention_reaches_default_threshold_exactly(self):
-        # Mention=80 + no content signals + no backlog (pending_count=0)
-        # = 80, exactly the default threshold
+    def test_mention_uses_strong_tier_base(self):
+        # v1.5.0: mention joins @ in the unified strong tier (default 100) —
+        # always above the default threshold 80, exempt from suppression
         verdict = evaluate_trigger_score(
             _snapshot(texts=["好的收到"], has_mention=True, pending_count=0, backlog_norm=1)
         )
-        assert verdict.score == 80
-        assert "直接信号=80(提及)" in verdict.breakdown
+        assert verdict.score == 100
+        assert "直接信号=100(提及)" in verdict.breakdown
+
+    def test_strong_signal_exempt_from_presence_suppression(self):
+        clean = evaluate_trigger_score(_snapshot(texts=["在吗"], has_mention=True))
+        saturated = evaluate_trigger_score(
+            _snapshot(
+                texts=["在吗"],
+                has_mention=True,
+                bot_recent_replies=15,
+                recent_window_total=20,
+            )
+        )
+        # Full suppression would be -25; the strong tier is exempt, so the
+        # saturated bot-reply share changes nothing
+        assert saturated.score == clean.score
+        assert "存在感=强信号豁免(应-25)" in saturated.breakdown
+
+    def test_strong_custom_base_score(self):
+        verdict = evaluate_trigger_score(
+            _snapshot(
+                texts=["在吗"], has_at=True, strong_signal_score=90,
+                pending_count=0, backlog_norm=1,
+            )
+        )
+        assert verdict.score == 90
+        assert "直接信号=90(@)" in verdict.breakdown
 
     def test_private_chat_base_relevance(self):
         verdict = evaluate_trigger_score(_snapshot(texts=["嗯"], is_group_chat=False))
@@ -185,8 +208,8 @@ class TestEvaluateTriggerScore:
         assert verdict.score < 80
 
     def test_content_signals_stack(self):
-        # Question +15, request +20, long text +5 — and the mention (80)
-        # provides direct context
+        # Question +15, request +20, long text +5 — and the strong mention
+        # tier (100 by default) provides direct context
         text = "帮我看看这个问题怎么解决好不好，有一段比较长的描述内容需要处理一下"
         verdict = evaluate_trigger_score(_snapshot(texts=[text], has_mention=True))
         assert "问题" in verdict.breakdown
@@ -281,27 +304,19 @@ class TestEvaluateTriggerScore:
         assert idle.score > base.score
         assert "闲时+15" in idle.breakdown
 
-    def test_presence_suppression(self):
-        clean = evaluate_trigger_score(_snapshot(texts=["在吗"], has_mention=True))
+    def test_ordinary_message_still_suppressed(self):
+        clean = evaluate_trigger_score(_snapshot())
         suppressed = evaluate_trigger_score(
-            _snapshot(
-                texts=["在吗"],
-                has_mention=True,
-                bot_recent_replies=15,
-                recent_window_total=20,
-            )
+            _snapshot(bot_recent_replies=15, recent_window_total=20)
         )
-        assert suppressed.score < clean.score
         assert "存在感=-25" in suppressed.breakdown
+        assert suppressed.score < clean.score
 
     def test_presence_free_below_ratio(self):
+        # Ordinary message, bot-reply share below the free ratio: no
+        # suppression entry in the breakdown
         free = evaluate_trigger_score(
-            _snapshot(
-                texts=["在吗"],
-                has_mention=True,
-                bot_recent_replies=2,
-                recent_window_total=20,
-            )
+            _snapshot(texts=["在吗"], bot_recent_replies=2, recent_window_total=20)
         )
         assert "存在感" not in free.breakdown
 
@@ -312,9 +327,9 @@ class TestEvaluateTriggerScore:
         half = evaluate_trigger_score(
             _snapshot(texts=["好的"], has_mention=True, pace_factor=0.5, pending_count=0)
         )
-        assert full.score == 80
-        # 80 × 0.75 = 60
-        assert half.score == 60
+        # Strong tier default 100; pace 0.5 → multiplier 0.75
+        assert full.score == 100
+        assert half.score == 75
         assert "倍率=0.75" in half.breakdown
 
     def test_score_never_negative(self):
@@ -356,8 +371,8 @@ class TestEvaluateTriggerScore:
 
 class TestFollowupTier:
     """Topic continuity: the follow-up direct-signal tier (per-message,
-    between mention 80 and private 40). One trunk scenario with branch
-    assertions on the same snapshot shape."""
+    between the strong tier (100 by default) and the private tier (40)).
+    One trunk scenario with branch assertions on the same snapshot shape."""
 
     def test_followup_tier_scoring(self):
         # Branch 1: base tier — 50 alone stays below the default threshold
@@ -382,7 +397,7 @@ class TestFollowupTier:
         assert "直接信号=100(@)" in evaluate_trigger_score(
             _snapshot(texts=["在吗"], has_at=True, followup=True, followup_score=50, pending_count=0)
         ).breakdown
-        assert "直接信号=80(提及)" in evaluate_trigger_score(
+        assert "直接信号=100(提及)" in evaluate_trigger_score(
             _snapshot(
                 texts=["好的收到"], has_mention=True, followup=True, followup_score=50,
                 pending_count=0, backlog_norm=1,
