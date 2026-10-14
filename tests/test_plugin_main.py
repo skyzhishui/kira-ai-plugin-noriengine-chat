@@ -173,36 +173,26 @@ class _FakePokeClient:
         self.calls.append((str(user_id), group_id))
 
 
-class _FakeMessageProcessor:
-    """Mirror of the real MessageProcessor.flush_session_messages: drain the
-    session buffer, publish a batch, return whether one was published."""
-
-    def __init__(self, ctx: "_FakeCtx"):
-        self._ctx = ctx
-
-    async def flush_session_messages(self, sid: str, extra_event=None) -> bool:
-        buffer = self._ctx.buffers.get(sid)
-        if buffer is None or buffer.get_length() == 0:
-            return False
-        buffer.items.clear()
-        self._ctx.flushed.append(sid)
-        return True
-
-
 class _FakeCtx:
     """Mirror of the real PluginContext surface the plugin touches.
 
-    Deliberately exposes NO ``flush_session_messages`` method: the real
-    PluginContext wrapper swallows the processor's bool return value, so the
-    plugin must read the publish result from ``message_processor`` directly —
-    if the plugin ever regresses to the wrapper, these tests fail loudly.
+    v3 semantics: flush_session_messages lives directly on the context,
+    drains the session buffer, publishes a batch and forwards whether one
+    was published — the plugin reads the publish result from this call.
     """
 
     def __init__(self, poke_client: "_FakePokeClient | None" = None):
         self.buffers: dict[str, _FakeBuffer] = {}
         self.flushed: list[str] = []
         self.adapter_mgr = _FakeAdapterManager(poke_client)
-        self.message_processor = _FakeMessageProcessor(self)
+
+    async def flush_session_messages(self, sid: str, filter_fn=None) -> bool:
+        buffer = self.buffers.get(sid)
+        if buffer is None or buffer.get_length() == 0:
+            return False
+        buffer.items.clear()
+        self.flushed.append(sid)
+        return True
 
     def get_buffer(self, sid: str) -> _FakeBuffer:
         if sid not in self.buffers:
@@ -1310,9 +1300,8 @@ class TestBusyQueue:
         assert plugin.gates.get(GROUP_SID).pending_score == 0.0
 
     def test_busy_holds_after_flush_until_round_end(self):
-        # P1 regression: PluginContext.flush_session_messages does not forward
-        # the processor's bool, so the publish result must come from
-        # message_processor directly — busy holds from the flush publish
+        # P1 regression: the publish result must come from the context call
+        # (v3 forwards the bool) — busy holds from the flush publish
         # until the round-end signal, instead of being released by the
         # empty-flush path right after every flush
         plugin, ctx = _make_plugin({"section_trigger": {"merge_wait_seconds": 0.1}})
@@ -1485,11 +1474,11 @@ class TestBusyQueue:
         # the watchdog timeout
         plugin, ctx = _make_plugin({"section_trigger": {"merge_wait_seconds": 0.1}})
 
-        async def fake_flush(sid, extra_event=None):
+        async def fake_flush(sid, filter_fn=None):
             ctx.get_buffer(sid).items.clear()
             return False
 
-        ctx.message_processor.flush_session_messages = fake_flush
+        ctx.flush_session_messages = fake_flush
 
         async def scenario():
             await plugin.handle_msg(_group_event(ctx, _FakeAt(SELF_ID), _FakeText("在吗")))
@@ -1506,10 +1495,10 @@ class TestBusyQueue:
         # enlarged to the busy-queue value
         plugin, ctx = _make_plugin({"section_trigger": {"merge_wait_seconds": 0.1}})
 
-        async def boom(sid, extra_event=None):
+        async def boom(sid, filter_fn=None):
             raise RuntimeError("flush boom")
 
-        ctx.message_processor.flush_session_messages = boom
+        ctx.flush_session_messages = boom
 
         async def scenario():
             await plugin.handle_msg(_group_event(ctx, _FakeAt(SELF_ID), _FakeText("在吗")))
@@ -1574,13 +1563,13 @@ class TestBusySpill:
             }
         )
         flushed_items = []
-        orig_flush = ctx.message_processor.flush_session_messages
+        orig_flush = ctx.flush_session_messages
 
-        async def spy_flush(sid, extra_event=None):
+        async def spy_flush(sid, filter_fn=None):
             flushed_items.append(self._buffer_texts(ctx, sid))
-            return await orig_flush(sid, extra_event)
+            return await orig_flush(sid)
 
-        ctx.message_processor.flush_session_messages = spy_flush
+        ctx.flush_session_messages = spy_flush
 
         async def scenario():
             plugin._mark_busy(GROUP_SID)
@@ -1714,10 +1703,10 @@ class TestBusySpill:
             }
         )
 
-        async def boom(sid, extra_event=None):
+        async def boom(sid, filter_fn=None):
             raise RuntimeError("flush boom")
 
-        ctx.message_processor.flush_session_messages = boom
+        ctx.flush_session_messages = boom
 
         async def scenario():
             plugin._mark_busy(GROUP_SID)
