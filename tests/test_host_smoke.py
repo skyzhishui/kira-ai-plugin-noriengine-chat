@@ -74,7 +74,7 @@ from core.prompt_manager import Prompt
 
 # v3: the plugin reads the flush publish result from the context call
 # (PluginContext.flush_session_messages forwards the underlying bool)
-assert "flush_session_messages" in PluginContext.__dict__
+assert callable(getattr(PluginContext, "flush_session_messages", None))
 
 print("HOST_IMPORTED", flush=True)
 
