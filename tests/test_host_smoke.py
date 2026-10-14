@@ -17,9 +17,9 @@ plugin's main.py and asserts:
    signature and data-structure assumptions (the ``buffer`` strategy of
    ``handle_msg``, the poke branch, the ``(event, action, result)``
    positional signature of ``track_bot_reply``, the ``Prompt.name/.content``
-   structure of ``LLMRequest.system_prompt``), and that PluginContext still
-   exposes ``message_processor`` (the plugin reads the flush publish result
-   from it directly).
+   structure of ``LLMRequest.system_prompt``), and that PluginContext
+   exposes ``flush_session_messages`` (v3 forwards the publish result,
+   which the plugin's empty-flush detection reads).
 
 The subprocess isolates ``sys.modules`` so it does not pollute the
 fake-host tests; when the host repository is missing or its dependencies
@@ -60,8 +60,8 @@ sys.path.insert(0, repo_root)
 sys.path.insert(0, plugin_dir)
 
 # ---- Phase 1: real host import ----
-from core.plugin.plugin_handlers import EventType, Priority
-from core.plugin.plugin_registry import _plugin_components
+from core.plugin.handlers import EventType, Priority
+from core.plugin.registry import _plugin_components
 from core.plugin.plugin_context import PluginContext
 from core.chat.message_utils import (
     KiraIMMessage, KiraMessageBatchEvent, KiraMessageEvent, MessageChain,
@@ -72,9 +72,9 @@ from core.adapter.adapter_info import AdapterInfo
 from core.provider import LLMRequest
 from core.prompt_manager import Prompt
 
-# The plugin reads the flush publish result from message_processor directly
-# (the PluginContext.flush_session_messages wrapper does not forward it)
-assert "message_processor" in PluginContext.__dataclass_fields__
+# v3: the plugin reads the flush publish result from the context call
+# (PluginContext.flush_session_messages forwards the underlying bool)
+assert "flush_session_messages" in PluginContext.__dict__
 
 print("HOST_IMPORTED", flush=True)
 
@@ -99,24 +99,18 @@ assert hooks["inject_group_prompt"].event_type == EventType.ON_LLM_REQUEST
 assert hooks["inject_group_prompt"].priority == Priority.MEDIUM
 
 # ---- Phase 3: drive the bound methods with real event classes ----
-class _StubProcessor:
-    def __init__(self, ctx):
-        self._ctx = ctx
-
-    async def flush_session_messages(self, sid, extra_event=None):
-        self._ctx.flushed.append(sid)
-        return True
-
-
 class _StubCtx:
-    # Mirrors the real PluginContext: flush goes through message_processor
-    # (the PluginContext wrapper does not forward the publish result)
+    # Mirrors the real v3 PluginContext: flush_session_messages lives on the
+    # context and forwards the publish result
     def __init__(self):
         self.flushed = []
-        self.message_processor = _StubProcessor(self)
 
     def get_buffer(self, sid):
         return None
+
+    async def flush_session_messages(self, sid, filter_fn=None):
+        self.flushed.append(sid)
+        return True
 
 
 SELF_ID = "3631688034"
