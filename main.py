@@ -1015,11 +1015,12 @@ class NoriEngineChatPlugin(BasePlugin):
                 # publish → batch processing (VLM/STT preprocessing) → LLM →
                 # update_memory, closing the gap earlier than ON_LLM_REQUEST
                 self._mark_busy(sid)
-                # Read the publish result from the MessageProcessor directly:
-                # the PluginContext.flush_session_messages wrapper does not
-                # forward the underlying bool, and the empty-flush detection
-                # below depends on it (default-chat uses the same direct call)
-                flushed = await self.ctx.message_processor.flush_session_messages(sid)
+                # v3 host API: PluginContext.flush_session_messages forwards
+                # the publish result directly, so the empty-flush detection
+                # below reads it from the context call (the deprecated
+                # MessageProcessor.flush_session_messages also returns it,
+                # but the context method is the supported surface)
+                flushed = await self.ctx.flush_session_messages(sid)
                 self.flush_pending.discard(sid)
                 if not flushed:
                     # Buffer was drained first by another consumer: no batch
